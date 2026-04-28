@@ -3799,13 +3799,13 @@ impl PredifiContract {
             if stake == 0 {
                 current_odds.push_back(0);
             } else {
-                // Exclude initial_liquidity from the denominator so odds reflect
-                // only user-contributed stakes, not the creator's seed liquidity.
-                let user_stake_total = pool.total_stake.saturating_sub(pool.initial_liquidity);
-                let odds = if user_stake_total <= 0 {
+                // Include initial_liquidity in the denominator so odds reflect
+                // the true probability including house money.
+                let total_for_odds = pool.total_stake;
+                let odds = if total_for_odds <= 0 {
                     0
                 } else {
-                    user_stake_total
+                    total_for_odds
                         .checked_mul(10000)
                         .expect("overflow")
                         .checked_div(stake)

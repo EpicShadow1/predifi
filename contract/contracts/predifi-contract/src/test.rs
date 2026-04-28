@@ -4352,6 +4352,59 @@ fn test_get_pool_stats() {
     assert_eq!(stats.current_odds.get(1), Some(16666));
 }
 
+fn test_get_pool_stats_with_initial_liquidity() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, _, token_admin_client, _, _, creator) = setup(&env);
+
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    token_admin_client.mint(&user1, &5000);
+    token_admin_client.mint(&user2, &5000);
+
+    // Create pool with initial liquidity of 1000
+    let pool_id = client.create_pool(
+        &creator,
+        &100000u64,
+        &token_address,
+        &2u32,
+        &symbol_short!("Tech"),
+        &PoolConfig {
+            description: String::from_str(&env, "Initial Liquidity Test"),
+            metadata_url: String::from_str(&env, "ipfs://metadata"),
+            min_stake: 1i128,
+            max_stake: 0i128,
+            max_total_stake: 0,
+            min_total_stake: 1,
+            initial_liquidity: 1000i128, // House provides 1000 initial liquidity
+            required_resolutions: 1u32, private: false, whitelist_key: None,
+            outcome_descriptions: soroban_sdk::vec![&env, String::from_str(&env, "Yes"), String::from_str(&env, "No")],
+        },
+    );
+
+    // Initial stats should show initial_liquidity in total_stake
+    let stats = client.get_pool_stats(&pool_id);
+    assert_eq!(stats.total_stake, 1000); // Only initial_liquidity
+
+    // User 1 bets 500 on outcome 0
+    client.place_prediction(&user1, &pool_id, &500, &0, &None, &None);
+    // User 2 bets 500 on outcome 1
+    client.place_prediction(&user2, &pool_id, &500, &1, &None, &None);
+
+    let stats = client.get_pool_stats(&pool_id);
+    assert_eq!(stats.total_stake, 2000); // 1000 initial + 500 + 500
+    assert_eq!(stats.stakes_per_outcome.get(0), Some(500));
+    assert_eq!(stats.stakes_per_outcome.get(1), Some(500));
+
+    // Odds should include initial_liquidity in denominator:
+    // Total for odds = 2000 (includes initial_liquidity)
+    // Outcome 0: (2000 * 10000) / 500 = 40000 (4.0x)
+    // Outcome 1: (2000 * 10000) / 500 = 40000 (4.0x)
+    assert_eq!(stats.current_odds.get(0), Some(40000));
+    assert_eq!(stats.current_odds.get(1), Some(40000));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // EDGE-CASE TESTS  (#327)
 // ═══════════════════════════════════════════════════════════════════════════
