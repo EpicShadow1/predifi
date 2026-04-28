@@ -112,6 +112,10 @@ pub const MAX_RESOLUTION_DELAY: u64 = 2_592_000;
 /// Miscellaneous predictions that don't fit other categories
 pub const CATEGORY_OTHER: Symbol = symbol_short!("Other");
 
+/// Minimum amount (in token base units / stroops) that may be withdrawn
+/// via `withdraw_treasury`. Prevents dust withdrawals.
+pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PROTOCOL INVARIANTS (for formal verification)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1048,11 +1052,10 @@ pub struct PredifiContract;
 impl PredifiContract {
     // ====== Pure Helper Functions (side-effect free, verifiable) ======
 
-    /// Validate that a category symbol is in the allowed list, falling back to CATEGORY_OTHER if not.
-    /// Validate category symbol against allowed list.
-    /// Returns the category if valid, otherwise returns InvalidData error.
+    /// Validate that a category symbol is in the allowed list.
+    /// Returns the category if valid, otherwise falls back to CATEGORY_OTHER.
     /// PRE: category is a valid Symbol
-    /// POST: returns Ok(category) if category is in the allowed list, else Err(InvalidData)
+    /// POST: returns Ok(category) if category is in the allowed list, else Ok(CATEGORY_OTHER)
     fn validate_category(env: &Env, category: &Symbol) -> Result<Symbol, PredifiError> {
         let mut allowed = Vec::new(env);
         allowed.push_back(CATEGORY_SPORTS);
@@ -1070,7 +1073,7 @@ impl PredifiContract {
                 }
             }
         }
-        Err(PredifiError::InvalidData)
+        Ok(CATEGORY_OTHER)
     }
 
     /// Validate core protocol invariants for a pool.
@@ -2641,7 +2644,7 @@ impl PredifiContract {
                         existing_outcome: i,
                     }
                     .publish(&env);
-                    break;
+                    return Err(PredifiError::ResolutionConflict);
                 }
             }
         }
@@ -4200,7 +4203,7 @@ impl OracleCallback for PredifiContract {
                         existing_outcome: i,
                     }
                     .publish(&env);
-                    break;
+                    return Err(PredifiError::ResolutionConflict);
                 }
             }
         }
