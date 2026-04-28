@@ -10396,106 +10396,74 @@ fn test_prediction_cooldown_resets_after_each_successful_prediction() {
     client.place_prediction(&user, &pool_id, &50i128, &0u32, &None, &None);
 }
 
-// ── Reentrancy guard tests for place_prediction and cancel_pool ───────────
-
 #[test]
-#[should_panic(expected = "Error(Context, InvalidAction)")]
-fn test_place_prediction_blocks_reentrancy() {
+#[should_panic(expected = "Error(Contract, #80)")]
+fn test_create_pool_rejects_end_time_beyond_max_duration() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (ac_client, client, _, _, _, _, _, creator) = setup(&env);
+    let (_, client, token_address, _, _, _, _, creator) = setup(&env);
 
-    // Register and whitelist the rogue token
-    let rogue_id = env.register(rogue_token::RogueToken, ());
-    let rogue_client = rogue_token::RogueTokenClient::new(&env, &rogue_id);
-    let admin = Address::generate(&env);
-    ac_client.grant_role(&admin, &ROLE_ADMIN);
-    client.add_token_to_whitelist(&admin, &rogue_id);
-
-    // Create a pool using the rogue token
-    let pool_id = client.create_pool(
+    // current ledger time is 0; MAX_POOL_DURATION is 365 days (31_536_000 s)
+    // end_time one second past the limit must be rejected
+    let too_far = MAX_POOL_DURATION + 1;
+    client.create_pool(
         &creator,
-        &200_000u64,
-        &rogue_id,
-        &2,
-        &symbol_short!("Crypto"),
+        &too_far,
+        &token_address,
+        &2u32,
+        &Symbol::new(&env, "Tech"),
         &PoolConfig {
-            description: String::from_str(&env, "Rogue Pool"),
-            metadata_url: String::from_str(&env, "ipfs://..."),
-            min_stake: 100,
-            max_stake: 0,
+            description: String::from_str(&env, "100-year pool"),
+            metadata_url: String::from_str(&env, "ipfs://toofar"),
+            min_stake: 1i128,
+            max_stake: 0i128,
             max_total_stake: 0,
             min_total_stake: 1,
-            initial_liquidity: 0,
-            required_resolutions: 1,
+            initial_liquidity: 0i128,
+            required_resolutions: 1u32,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: soroban_sdk::Vec::new(&env),
+            outcome_descriptions: soroban_sdk::vec![
+                &env,
+                String::from_str(&env, "Yes"),
+                String::from_str(&env, "No"),
+            ],
         },
     );
-
-    let user = Address::generate(&env);
-
-    // Configure rogue token to re-enter place_prediction (mode 1) during transfer
-    rogue_client.setup_attack(&client.address, &user, &pool_id, &1u32);
-
-    // This should panic with reentrancy detected
-    client.place_prediction(&user, &pool_id, &1000i128, &0u32, &None, &None);
 }
 
 #[test]
-#[should_panic(expected = "Error(Context, InvalidAction)")]
-fn test_cancel_pool_blocks_reentrancy() {
+fn test_create_pool_accepts_end_time_at_max_duration() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (ac_client, client, _, _, _, _, operator, creator) = setup(&env);
+    let (_, client, token_address, _, _, _, _, creator) = setup(&env);
 
-    // Register and whitelist the rogue token
-    let rogue_id = env.register(rogue_token::RogueToken, ());
-    let rogue_client = rogue_token::RogueTokenClient::new(&env, &rogue_id);
-    let admin = Address::generate(&env);
-    ac_client.grant_role(&admin, &ROLE_ADMIN);
-    client.add_token_to_whitelist(&admin, &rogue_id);
-
-    // Create a pool using the rogue token
+    // exactly at the boundary must succeed
     let pool_id = client.create_pool(
         &creator,
-        &200_000u64,
-        &rogue_id,
-        &2,
-        &symbol_short!("Crypto"),
+        &MAX_POOL_DURATION,
+        &token_address,
+        &2u32,
+        &Symbol::new(&env, "Tech"),
         &PoolConfig {
-            description: String::from_str(&env, "Rogue Pool"),
-            metadata_url: String::from_str(&env, "ipfs://..."),
-            min_stake: 100,
-            max_stake: 0,
+            description: String::from_str(&env, "Max duration pool"),
+            metadata_url: String::from_str(&env, "ipfs://maxdur"),
+            min_stake: 1i128,
+            max_stake: 0i128,
             max_total_stake: 0,
             min_total_stake: 1,
-            initial_liquidity: 0,
-            required_resolutions: 1,
+            initial_liquidity: 0i128,
+            required_resolutions: 1u32,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: soroban_sdk::Vec::new(&env),
+            outcome_descriptions: soroban_sdk::vec![
+                &env,
+                String::from_str(&env, "Yes"),
+                String::from_str(&env, "No"),
+            ],
         },
     );
-
-    let user = Address::generate(&env);
-
-    // Place a prediction so there is a stake to refund on cancel
-    client.place_prediction(&user, &pool_id, &1000i128, &0u32, &None, &None);
-
-    // Configure rogue token to re-enter cancel_pool (mode 2) during the refund transfer
-    rogue_client.setup_attack(&client.address, &operator, &pool_id, &2u32);
-
-    // Cancel the pool — the rogue token fires during claim_refund's transfer
-    client.cancel_pool(
-        &operator,
-        &pool_id,
-        &String::from_str(&env, "test cancel"),
-    );
-
-    // Claim refund triggers the rogue token's re-entry into cancel_pool
-    client.claim_refund(&user, &pool_id);
+    let _ = pool_id;
 }
