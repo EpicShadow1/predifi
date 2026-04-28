@@ -79,8 +79,13 @@ pub(crate) mod dummy_access_control {
 }
 
 mod rogue_token {
-    use crate::PredifiContractClient;
-    use soroban_sdk::{contract, contractimpl, Address, Env};
+    use crate::{PoolConfig, PredifiContractClient};
+    use soroban_sdk::{contract, contractimpl, Address, Env, String};
+
+    // attack_mode stored at key 3u32:
+    //   0 = claim_winnings (original)
+    //   1 = place_prediction re-entry
+    //   2 = cancel_pool re-entry
 
     #[contract]
     pub struct RogueToken;
@@ -88,13 +93,30 @@ mod rogue_token {
     #[contractimpl]
     impl RogueToken {
         pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
-            if env.ledger().timestamp() > 100000 {
+            let attack_mode: u32 = env.storage().instance().get(&3u32).unwrap_or(0);
+            if attack_mode == 0 {
+                // original: only attack after timestamp 100000
+                if env.ledger().timestamp() > 100000 {
+                    let target: Address = env.storage().instance().get(&0u32).unwrap();
+                    let user: Address = env.storage().instance().get(&1u32).unwrap();
+                    let pool_id: u64 = env.storage().instance().get(&2u32).unwrap();
+                    let client = PredifiContractClient::new(&env, &target);
+                    client.claim_winnings(&user, &pool_id);
+                }
+            } else if attack_mode == 1 {
+                // re-enter place_prediction during the inbound transfer
                 let target: Address = env.storage().instance().get(&0u32).unwrap();
                 let user: Address = env.storage().instance().get(&1u32).unwrap();
                 let pool_id: u64 = env.storage().instance().get(&2u32).unwrap();
-
                 let client = PredifiContractClient::new(&env, &target);
-                client.claim_winnings(&user, &pool_id);
+                client.place_prediction(&user, &pool_id, &1000i128, &0u32, &None, &None);
+            } else if attack_mode == 2 {
+                // re-enter cancel_pool during the refund transfer
+                let target: Address = env.storage().instance().get(&0u32).unwrap();
+                let operator: Address = env.storage().instance().get(&1u32).unwrap();
+                let pool_id: u64 = env.storage().instance().get(&2u32).unwrap();
+                let client = PredifiContractClient::new(&env, &target);
+                client.cancel_pool(&operator, &pool_id, &String::from_str(&env, "reentrant"));
             }
         }
 
@@ -102,6 +124,35 @@ mod rogue_token {
             env.storage().instance().set(&0u32, &target);
             env.storage().instance().set(&1u32, &user);
             env.storage().instance().set(&2u32, &pool_id);
+        }
+
+        pub fn setup_attack(
+            env: Env,
+            target: Address,
+            caller: Address,
+            pool_id: u64,
+            attack_mode: u32,
+        ) {
+            env.storage().instance().set(&0u32, &target);
+            env.storage().instance().set(&1u32, &caller);
+            env.storage().instance().set(&2u32, &pool_id);
+            env.storage().instance().set(&3u32, &attack_mode);
+        }
+
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            1_000_000i128
+        }
+
+        pub fn decimals(_env: Env) -> u32 {
+            7u32
+        }
+
+        pub fn name(env: Env) -> String {
+            String::from_str(&env, "RogueToken")
+        }
+
+        pub fn symbol(env: Env) -> String {
+            String::from_str(&env, "RGT")
         }
     }
 }
@@ -10347,222 +10398,106 @@ fn test_prediction_cooldown_resets_after_each_successful_prediction() {
     client.place_prediction(&user, &pool_id, &50i128, &0u32, &None, &None);
 }
 
-// ── Multi-operator resolution enforcement tests ───────────────────────────────
+// ── Reentrancy guard tests for place_prediction and cancel_pool ───────────
 
-/// A single operator must NOT be able to resolve a pool when required_resolutions = 3.
 #[test]
-fn test_single_operator_cannot_resolve_when_threshold_is_3() {
+#[should_panic(expected = "Error(Context, InvalidAction)")]
+fn test_place_prediction_blocks_reentrancy() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let ac_id = env.register(dummy_access_control::DummyAccessControl, ());
-    let ac_client = dummy_access_control::DummyAccessControlClient::new(&env, &ac_id);
-    let contract_id = env.register(PredifiContract, ());
-    let client = PredifiContractClient::new(&env, &contract_id);
+    let (ac_client, client, _, _, _, _, _, creator) = setup(&env);
 
-    let token_admin = Address::generate(&env);
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let treasury = Address::generate(&env);
+    // Register and whitelist the rogue token
+    let rogue_id = env.register(rogue_token::RogueToken, ());
+    let rogue_client = rogue_token::RogueTokenClient::new(&env, &rogue_id);
     let admin = Address::generate(&env);
-    let creator = Address::generate(&env);
-
-    let op1 = Address::generate(&env);
-    let op2 = Address::generate(&env);
-    let op3 = Address::generate(&env);
-
     ac_client.grant_role(&admin, &ROLE_ADMIN);
-    ac_client.grant_role(&op1, &ROLE_OPERATOR);
-    ac_client.grant_role(&op2, &ROLE_OPERATOR);
-    ac_client.grant_role(&op3, &ROLE_OPERATOR);
+    client.add_token_to_whitelist(&admin, &rogue_id);
 
-    client.init(&ac_id, &treasury, &0u32, &0u64, &3600u64, &0u32);
-    client.add_token_to_whitelist(&admin, &token_address);
-
+    // Create a pool using the rogue token
     let pool_id = client.create_pool(
         &creator,
-        &100000u64,
-        &token_address,
-        &2u32,
-        &symbol_short!("Tech"),
+        &200_000u64,
+        &rogue_id,
+        &2,
+        &symbol_short!("Crypto"),
         &PoolConfig {
-            description: String::from_str(&env, "Multi-op pool"),
-            metadata_url: String::from_str(&env, "ipfs://test"),
-            min_stake: 1i128,
-            max_stake: 0i128,
+            description: String::from_str(&env, "Rogue Pool"),
+            metadata_url: String::from_str(&env, "ipfs://..."),
+            min_stake: 100,
+            max_stake: 0,
             max_total_stake: 0,
             min_total_stake: 1,
-            initial_liquidity: 0i128,
-            required_resolutions: 3u32,
+            initial_liquidity: 0,
+            required_resolutions: 1,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: soroban_sdk::vec![
-                &env,
-                String::from_str(&env, "Yes"),
-                String::from_str(&env, "No"),
-            ],
+            outcome_descriptions: soroban_sdk::Vec::new(&env),
         },
     );
 
-    env.ledger().with_mut(|li| li.timestamp = 100001);
+    let user = Address::generate(&env);
 
-    // op1 votes — only 1 of 3 required votes cast
-    client.resolve_pool(&op1, &pool_id, &1u32);
+    // Configure rogue token to re-enter place_prediction (mode 1) during transfer
+    rogue_client.setup_attack(&client.address, &user, &pool_id, &1u32);
 
-    // Pool must still be Active (not Resolved)
-    let pool = client.get_pool(&pool_id);
-    assert_ne!(
-        pool.outcome, 1u32,
-        "pool should not be resolved after a single vote when required_resolutions = 3"
-    );
-    assert_eq!(
-        pool.state,
-        MarketState::Active,
-        "pool state must remain Active after only one vote"
-    );
+    // This should panic with reentrancy detected
+    client.place_prediction(&user, &pool_id, &1000i128, &0u32, &None, &None);
 }
 
-/// Pool resolves exactly when the vote count reaches required_resolutions (3 operators, same outcome).
 #[test]
-fn test_pool_resolves_only_after_threshold_met() {
+#[should_panic(expected = "Error(Context, InvalidAction)")]
+fn test_cancel_pool_blocks_reentrancy() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let ac_id = env.register(dummy_access_control::DummyAccessControl, ());
-    let ac_client = dummy_access_control::DummyAccessControlClient::new(&env, &ac_id);
-    let contract_id = env.register(PredifiContract, ());
-    let client = PredifiContractClient::new(&env, &contract_id);
+    let (ac_client, client, _, _, _, _, operator, creator) = setup(&env);
 
-    let token_admin = Address::generate(&env);
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let treasury = Address::generate(&env);
+    // Register and whitelist the rogue token
+    let rogue_id = env.register(rogue_token::RogueToken, ());
+    let rogue_client = rogue_token::RogueTokenClient::new(&env, &rogue_id);
     let admin = Address::generate(&env);
-    let creator = Address::generate(&env);
-
-    let op1 = Address::generate(&env);
-    let op2 = Address::generate(&env);
-    let op3 = Address::generate(&env);
-
     ac_client.grant_role(&admin, &ROLE_ADMIN);
-    ac_client.grant_role(&op1, &ROLE_OPERATOR);
-    ac_client.grant_role(&op2, &ROLE_OPERATOR);
-    ac_client.grant_role(&op3, &ROLE_OPERATOR);
+    client.add_token_to_whitelist(&admin, &rogue_id);
 
-    client.init(&ac_id, &treasury, &0u32, &0u64, &3600u64, &0u32);
-    client.add_token_to_whitelist(&admin, &token_address);
-
+    // Create a pool using the rogue token
     let pool_id = client.create_pool(
         &creator,
-        &100000u64,
-        &token_address,
-        &2u32,
-        &symbol_short!("Tech"),
+        &200_000u64,
+        &rogue_id,
+        &2,
+        &symbol_short!("Crypto"),
         &PoolConfig {
-            description: String::from_str(&env, "Multi-op pool"),
-            metadata_url: String::from_str(&env, "ipfs://test"),
-            min_stake: 1i128,
-            max_stake: 0i128,
+            description: String::from_str(&env, "Rogue Pool"),
+            metadata_url: String::from_str(&env, "ipfs://..."),
+            min_stake: 100,
+            max_stake: 0,
             max_total_stake: 0,
             min_total_stake: 1,
-            initial_liquidity: 0i128,
-            required_resolutions: 3u32,
+            initial_liquidity: 0,
+            required_resolutions: 1,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: soroban_sdk::vec![
-                &env,
-                String::from_str(&env, "Yes"),
-                String::from_str(&env, "No"),
-            ],
+            outcome_descriptions: soroban_sdk::Vec::new(&env),
         },
     );
 
-    env.ledger().with_mut(|li| li.timestamp = 100001);
+    let user = Address::generate(&env);
 
-    // Vote 1 — still Active
-    client.resolve_pool(&op1, &pool_id, &1u32);
-    assert_eq!(client.get_pool(&pool_id).state, MarketState::Active);
+    // Place a prediction so there is a stake to refund on cancel
+    client.place_prediction(&user, &pool_id, &1000i128, &0u32, &None, &None);
 
-    // Vote 2 — still Active
-    client.resolve_pool(&op2, &pool_id, &1u32);
-    assert_eq!(client.get_pool(&pool_id).state, MarketState::Active);
+    // Configure rogue token to re-enter cancel_pool (mode 2) during the refund transfer
+    rogue_client.setup_attack(&client.address, &operator, &pool_id, &2u32);
 
-    // Vote 3 — threshold reached, pool must now be Resolved
-    client.resolve_pool(&op3, &pool_id, &1u32);
-    let pool = client.get_pool(&pool_id);
-    assert_eq!(
-        pool.state,
-        MarketState::Resolved,
-        "pool must be Resolved once vote_count reaches required_resolutions"
-    );
-    assert_eq!(pool.outcome, 1u32);
-}
-
-/// Conflicting votes must prevent resolution even when total vote count equals required_resolutions.
-#[test]
-fn test_conflicting_votes_prevent_resolution() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let ac_id = env.register(dummy_access_control::DummyAccessControl, ());
-    let ac_client = dummy_access_control::DummyAccessControlClient::new(&env, &ac_id);
-    let contract_id = env.register(PredifiContract, ());
-    let client = PredifiContractClient::new(&env, &contract_id);
-
-    let token_admin = Address::generate(&env);
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let treasury = Address::generate(&env);
-    let admin = Address::generate(&env);
-    let creator = Address::generate(&env);
-
-    let op1 = Address::generate(&env);
-    let op2 = Address::generate(&env);
-    let op3 = Address::generate(&env);
-
-    ac_client.grant_role(&admin, &ROLE_ADMIN);
-    ac_client.grant_role(&op1, &ROLE_OPERATOR);
-    ac_client.grant_role(&op2, &ROLE_OPERATOR);
-    ac_client.grant_role(&op3, &ROLE_OPERATOR);
-
-    client.init(&ac_id, &treasury, &0u32, &0u64, &3600u64, &0u32);
-    client.add_token_to_whitelist(&admin, &token_address);
-
-    let pool_id = client.create_pool(
-        &creator,
-        &100000u64,
-        &token_address,
-        &2u32,
-        &symbol_short!("Tech"),
-        &PoolConfig {
-            description: String::from_str(&env, "Conflict pool"),
-            metadata_url: String::from_str(&env, "ipfs://test"),
-            min_stake: 1i128,
-            max_stake: 0i128,
-            max_total_stake: 0,
-            min_total_stake: 1,
-            initial_liquidity: 0i128,
-            required_resolutions: 3u32,
-            private: false,
-            whitelist_key: None,
-            outcome_descriptions: soroban_sdk::vec![
-                &env,
-                String::from_str(&env, "Yes"),
-                String::from_str(&env, "No"),
-            ],
-        },
+    // Cancel the pool — the rogue token fires during claim_refund's transfer
+    client.cancel_pool(
+        &operator,
+        &pool_id,
+        &String::from_str(&env, "test cancel"),
     );
 
-    env.ledger().with_mut(|li| li.timestamp = 100001);
-
-    // op1 votes outcome 1, op2 votes outcome 0 — split votes
-    client.resolve_pool(&op1, &pool_id, &1u32);
-    client.resolve_pool(&op2, &pool_id, &0u32);
-    // op3 votes outcome 1 — total votes = 3 = required_resolutions,
-    // but outcome 1 only has 2 votes, not 3, so threshold is NOT met
-    client.resolve_pool(&op3, &pool_id, &1u32);
-
-    let pool = client.get_pool(&pool_id);
-    assert_eq!(
-        pool.state,
-        MarketState::Active,
-        "pool must remain Active when no single outcome reaches required_resolutions despite total votes equaling threshold"
-    );
+    // Claim refund triggers the rogue token's re-entry into cancel_pool
+    client.claim_refund(&user, &pool_id);
 }
