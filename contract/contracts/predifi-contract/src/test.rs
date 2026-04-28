@@ -5440,7 +5440,7 @@ fn test_resolve_pool_rejects_out_of_bounds_outcome() {
     );
 
     env.ledger().with_mut(|li| li.timestamp = 100_001);
-    // Outcome 3 is out-of-bounds for a 3-option pool.
+    // Outcome 3 is out-of-bounds for a 3-option pool; must return Err(InvalidOutcome).
     let result = client.try_resolve_pool(&operator, &pool_id, &3u32);
     assert_eq!(result, Err(Ok(PredifiError::InvalidOutcome)));
 }
