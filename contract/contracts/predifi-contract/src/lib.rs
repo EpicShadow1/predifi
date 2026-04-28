@@ -4044,6 +4044,13 @@ impl PredifiContract {
                 if tier.fee_bps > 10_000 {
                     return Err(PredifiError::InvalidFeeBps);
                 }
+                if i > 0 {
+                    if let Some(prev) = tiers.get(i - 1) {
+                        if tier.stake_threshold <= prev.stake_threshold {
+                            return Err(PredifiError::InvalidFeeBps);
+                        }
+                    }
+                }
             }
         }
 
